@@ -10,6 +10,8 @@ using System.Linq;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using AdvocatesListService.Model;
+using Microsoft.WindowsAzure.Storage;
+using System.Text.Json;
 
 namespace AdvocatesListService
 {
@@ -17,14 +19,17 @@ namespace AdvocatesListService
     {
         private static string GitHubToken = Environment.GetEnvironmentVariable("GitHubToken");
 
-        [FunctionName(nameof(Advocates))]
-        public static async Task<List<AdvocateMapping>> Advocates(
-            [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = null)] HttpRequest req,
-            ILogger log)
+        [FunctionName(nameof(UpdateAdvocatesTimerAsync))]
+        public static async Task UpdateAdvocatesTimerAsync([TimerTrigger("0 0 13 * * *")] TimerInfo myTimer, ILogger log)
         {
-            log.LogInformation("C# HTTP trigger function processed a request.");
+            List<AdvocateMapping> advocatesResult = await GenerateAdvocatesList(log);
+            await SaveToBlobStorageAsync(advocatesResult);
+        }
+
+        private static async Task<List<AdvocateMapping>> GenerateAdvocatesList(ILogger log)
+        {
             var github = new GitHubClient(new ProductHeaderValue("cloud-advocate-parser"));
-            
+
             var tokenAuth = new Credentials(GitHubToken);
             github.Credentials = tokenAuth;
 
@@ -36,18 +41,18 @@ namespace AdvocatesListService
 
             IEnumerable<RepositoryContent> advocatesYamls = contents
                 .Where(x => Path.GetExtension(x.Path) == ".yml")
-                .Where(x=> !x.Path.EndsWith("index.html.yml"))
-                .Where(x=> !x.Path.EndsWith("index.yml"))
-                .Where(x=> !x.Path.EndsWith("toc.yml"))
-                .Where(x=> !x.Path.EndsWith("tweets.yml"))
-                .Where(x=> !x.Path.EndsWith("map.yml"));
+                .Where(x => !x.Path.EndsWith("index.html.yml"))
+                .Where(x => !x.Path.EndsWith("index.yml"))
+                .Where(x => !x.Path.EndsWith("toc.yml"))
+                .Where(x => !x.Path.EndsWith("tweets.yml"))
+                .Where(x => !x.Path.EndsWith("map.yml"));
 
             Regex msAuthorRegex = new Regex("ms.author: (?<msauthor>.*)");
             Regex teamRegEx = new Regex("team: (?<team>.*)");
             Regex githubUsernameRegex = new Regex("url: https?://github.com/(?<username>.+)/?");
 
-            var advocatesResult = new List<AdvocateMapping>();
 
+            List<AdvocateMapping> advocatesResult = new List<AdvocateMapping>();
             foreach (var gitAdvocate in advocatesYamls)
             {
                 var fileReference = await github.Git.Blob.Get("MicrosoftDocs", "cloud-developer-advocates", gitAdvocate.Sha);
@@ -67,8 +72,55 @@ namespace AdvocatesListService
                 }
             }
 
-
             return advocatesResult;
+        }
+
+        [FunctionName(nameof(Advocates))]
+        public static async Task<List<AdvocateMapping>> Advocates(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = null)] HttpRequest req,
+            ILogger log)
+        {
+            List<AdvocateMapping> advocatesResult = await GetResultFromBlobStorageAsync();
+
+            if(advocatesResult == null)
+            {
+                advocatesResult = await GenerateAdvocatesList(log);
+                await SaveToBlobStorageAsync(advocatesResult);
+            }
+            return advocatesResult;
+        }
+
+        private static async Task SaveToBlobStorageAsync(List<AdvocateMapping> advocatesResult)
+        {
+            CloudStorageAccount account;
+            if (CloudStorageAccount.TryParse(Environment.GetEnvironmentVariable("AzureWebJobsStorage"), out account))
+            {
+                var client = account.CreateCloudBlobClient();
+                var container = client.GetContainerReference("cache");
+                await container.CreateIfNotExistsAsync();
+
+                var advocatesFile = container.GetBlockBlobReference("advocates.json");
+                await advocatesFile.UploadTextAsync(JsonSerializer.Serialize(advocatesResult));
+            }
+        }
+
+        private static async Task<List<AdvocateMapping>> GetResultFromBlobStorageAsync()
+        {
+            CloudStorageAccount account;
+            if (!CloudStorageAccount.TryParse(Environment.GetEnvironmentVariable("AzureWebJobsStorage"), out account))
+            {
+                return null;
+            }
+
+            var client = account.CreateCloudBlobClient();
+            var container = client.GetContainerReference("cache");
+            await container.CreateIfNotExistsAsync();
+
+            var advocatesFile = container.GetBlockBlobReference("advocates.json");
+            if (!await advocatesFile.ExistsAsync()) return null;
+
+            string jsonContent = await advocatesFile.DownloadTextAsync();
+            return JsonSerializer.Deserialize<List<AdvocateMapping>>(jsonContent);
         }
 
         private static string Base64Decode(string base64EncodedData)
